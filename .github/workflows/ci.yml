@@ -1,82 +1,69 @@
-name: CI/CD Pipeline # (ou le nom que tu as mis)
+name: K8s Container Pipeline
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  packages: write   # autorise la publication d'images sur GHCR
 
 jobs:
-  # ==========================================
-  # 1. TON JOB DU TP2 (Tests, SonarQube, etc.)
-  # ==========================================
-  build-and-test:
+  # 1. Construire l'image et la publier sur GitHub Container Registry (GHCR)
+  build-and-push:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout du code
-        uses: actions/checkout@v4
-      # ... tes autres étapes du TP2 ...
+      - uses: actions/checkout@v4
 
-  # ==========================================
-  # 2. LE NOUVEAU JOB DU TP3 (À AJOUTER ICI)
-  # ==========================================
-  deploy-k8s:
-    needs: [build-and-test] # Important : On attend que le job au-dessus réussisse !
-    runs-on: ubuntu-latest
-    
-    # Permission requise pour publier sur GHCR
-    permissions:
-      contents: read
-      packages: write
+      - name: Nom de l'image en minuscules
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/webapp" >> "$GITHUB_ENV"
 
-    steps:
-      - name: Checkout du code
-        uses: actions/checkout@v4
-
-      - name: Connexion à GitHub Container Registry
+      - name: Connexion a GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Définir le nom de l'image en minuscules
-        run: |
-          LOWERCASE_URL=$(echo "ghcr.io/${{ github.repository_owner }}/webapp:${{ github.sha }}" | tr '[:upper:]' '[:lower:]')
-          echo "IMAGE_NAME=$LOWERCASE_URL" >> $GITHUB_ENV
-
-      - name: Build et Push de l'image Docker
-        uses: docker/build-push-action@v5
+      - name: Build et push
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ env.IMAGE_NAME }}
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
 
-      - name: Création du cluster Kubernetes (Kind)
-        uses: helm/kind-action@v1.8.0
+  # 2. Deployer l'image sur un cluster Kubernetes ephemere (kind)
+  deploy-k8s:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Nom de l'image en minuscules
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/webapp" >> "$GITHUB_ENV"
+
+      - name: Creer un cluster Kubernetes ephemere (kind)
+        uses: helm/kind-action@v1
         with:
-          cluster_name: kind-cluster
+          cluster_name: tp3
 
-      - name: Injecter la vraie image dans le manifest
-        run: |
-          sed -i "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}|g" k8s/deployment.yaml
-
-      - name: Création du secret d'authentification GHCR dans K8s
+      - name: Creer le secret pour tirer l'image privee depuis GHCR
         run: |
           kubectl create secret docker-registry ghcr-secret \
             --docker-server=ghcr.io \
             --docker-username=${{ github.actor }} \
             --docker-password=${{ secrets.GITHUB_TOKEN }}
 
-      - name: Déploiement sur Kubernetes
+      - name: Injecter l'image puis deployer les manifests
         run: |
-          kubectl apply -f k8s/deployment.yaml
-          kubectl apply -f k8s/service.yaml
+          sed -i "s|IMAGE_PLACEHOLDER|${IMAGE}:${GITHUB_SHA}|g" k8s/deployment.yaml
+          kubectl apply -f k8s/
+          kubectl rollout status deployment/webapp --timeout=120s
 
-      - name: Vérification du déploiement (Rollout)
+      - name: Verifier le deploiement (smoke test) 
         run: |
-          kubectl rollout status deployment/webapp --timeout=60s
-
-      - name: Smoke Test (Vérification de la route /health)
-        run: |
-          kubectl get pods
-          kubectl get services
+          kubectl get pods -o wide
+          kubectl get svc webapp
+          kubectl port-forward svc/webapp 8080:80 &
+          sleep 5
+          curl -s http://localhost:8080/ | grep -i "hello"
